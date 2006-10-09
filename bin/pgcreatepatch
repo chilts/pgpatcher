@@ -1,0 +1,292 @@
+#!/usr/bin/perl
+## -------------------------------------------------------------------*-perl-*-
+#
+# Copyright (c) 2005 Andrew Chilton <apc@chilts.org>
+#  - original author and maintenance
+#
+# This code is hereby licensed for public consumption under either the
+# GNU GPL v2 or greater, or Larry Wall's Artistic license - your choice.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+#
+## ----------------------------------------------------------------------------
+
+use strict;
+use warnings;
+
+use IO::File;
+use Getopt::Mixed "nextOption";
+
+## ----------------------------------------------------------------------------
+# globals
+
+my @in_opts = qw( level=i  l>level
+                  name=s   n>name
+                  script=s s>script
+                  help
+                  version );
+
+my $DEBUG = 0;
+
+## ----------------------------------------------------------------------------
+
+MAIN: {
+    # get the command line options
+    my $opts = { name => 'Patch Level', script => 'patch' };
+    Getopt::Mixed::init( @in_opts );
+    while( my($opt, $val, $pretty) = nextOption() ) {
+        $opts->{$opt} = $val;
+    }
+    Getopt::Mixed::cleanup();
+
+    # do the version and help
+    if ( exists $opts->{version} ) {
+        print "$0 v0.1\n";
+        exit 0;
+    }
+
+    if ( exists $opts->{help} ) {
+        usage();
+        exit 0;
+    }
+
+   # check there is a patch level
+   unless ( defined $opts->{level} and $opts->{level} =~ /^\d+$/ and $opts->{level} > 0 ) {
+       Getopt::Mixed::abortMsg("please specify a positive numeric patch level");
+   }
+
+   # create the patch
+   create_patch( $opts->{name}, $opts->{level}, $opts->{script} );
+}
+
+## ----------------------------------------------------------------------------
+# subs
+
+sub create_patch
+{
+    my ($name, $level, $script) = @_;
+
+    my $forward = "${script}_" . ($level-1) . "_${level}.sql";
+    my $reverse = "${script}_${level}_" . ($level-1) . '.sql';
+
+    if ( -e $forward ) {
+        print STDERR "Forward patch already exists\n";
+    } else {
+        my $patch;
+        if ( $level != 1 ) {
+            $patch = <<"END_FORWARD"
+BEGIN;
+
+-- ----------------------------------------------------------------------------
+
+-- PATCH HERE
+
+-- ----------------------------------------------------------------------------
+
+UPDATE property SET value = $level WHERE key = '$name';
+
+COMMIT;
+END_FORWARD
+        } else {
+            $patch = <<"END_FORWARD"
+BEGIN;
+
+-- ----------------------------------------------------------------------------
+
+CREATE TABLE property (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- ----------------------------------------------------------------------------
+
+INSERT INTO property(key, value) VALUES('$name', 1);
+
+COMMIT;
+END_FORWARD
+        }
+        # output to the patch file
+        my $fh = IO::File->new($forward, 'w');
+        print $fh $patch;
+        undef $fh;
+    }
+
+    if ( -e $reverse ) {
+        print STDERR "Reverse patch already exists\n";
+    } else {
+        my $patch;
+        my $new_level = $level - 1;
+        if ( $level != 1 ) {
+            $patch = <<"END_REVERSE"
+BEGIN;
+
+-- ----------------------------------------------------------------------------
+
+-- PATCH HERE
+
+-- ----------------------------------------------------------------------------
+
+UPDATE property SET value = $new_level WHERE key = '$name';
+
+COMMIT;
+END_REVERSE
+        } else {
+            $patch = <<"END_REVERSE"
+BEGIN;
+
+-- ----------------------------------------------------------------------------
+
+DROP TABLE property;
+
+-- ----------------------------------------------------------------------------
+
+COMMIT;
+END_REVERSE
+        }
+        # output to the patch file
+        my $fh = IO::File->new($reverse, 'w');
+        print $fh $patch;
+        undef $fh;
+    }
+}
+
+sub usage
+{
+   print <<"END_USAGE";
+Usage: $0 [OPTION]...
+
+Options:
+  -s, --script SCRIPTNAME  basename of patch scripts to use (default: 'patch')
+  -n, --name PATCHNAME     the patch name to use (default: 'Patch Level')
+  -l, --level PATCHLEVEL   version to create patches for
+      --help               prints help then quits
+      --version            prints version information then quits
+
+Report bugs at <http://code.google.com/p/pgpatcher/issues/list>.
+END_USAGE
+}
+
+## ----------------------------------------------------------------------------
+=pod
+
+=head1 NAME
+
+pgcreatepatch - a tool to help patch a PostgreSQL database using pgpatcher
+
+=head1 SYNOPSIS
+
+B<pgcreatepatch> [OPTION]...
+
+=head1 EXAMPLES
+
+    # create a patch level 1 script (and it's reverse)
+    pgcreatpatch -l 1
+
+    # create a patch level 2 script (and it's reverse)
+    pgpatcher -l 2
+
+    # create patch level 2, using the script name 'main'
+    # and using the patch name 'Main Patch Level'
+    pgpatcher -s main -n 'Main Patch Level' -l 2
+
+    # create patch level 2, using the script name 'blog'
+    # and using the patch name 'Blog Patch Level'
+    pgpatcher -s blog -n 'Blog Patch Level' -l 2
+
+=head1 DESCRIPTION
+
+This is a helper script which enables you to create patch files for pgpatcher
+easily. For the main documentation, see 'man pgpatcher'.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-s, --script> SCRIPTNAME
+
+The patch script prefix to find the patch scripts (default: 'patch'). Patch
+scripts are of the form:
+
+    patch_<fromlevel>_<tolevel>.sql
+
+Whichever level you choose, both the following patch files are created (unless
+they already exist):
+
+    patch_<n-1>_<n>.sql
+    patch_<n>_<n-1>.sql
+
+=item B<-n, --name> PATCHNAME
+
+Allows independent patching using different names. If you use this, then you
+may want to edit the patch_0_1.sql file so that it does not automatically
+create the 'property' table which is the usual procedure. You may also need to
+use this in conjunction with -s.
+
+=item B<-l, --level> PATCHLEVEL
+
+The number to patch to. These must be non-negative integers. Each script which
+changes the database (and hence has a patch leve), must make sure to update the
+actual patch level in the database to be the one it says it will patch to
+(ie. the patch includes both the patch and the update of the patch level, all
+in the same transaction).
+
+=item B<-h, --help>
+
+Outputs help information and exits.
+
+=item B<-V, --version>
+
+Outputs version information and exits.
+
+=back
+
+=head2 Example Initial Patch Scripts
+
+An example patch_0_1.sql:
+
+    BEGIN;
+    CREATE TABLE property (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    );
+    INSERT INTO property(key, value) VALUES('PATCH_LEVEL', 1);
+    COMMIT;
+
+An example patch_1_0.sql:
+
+    BEGIN;
+    DROP TABLE property;
+    COMMIT;
+
+To make it easy, you could leave both of these patch scripts as they are and
+only start doing your own database definition in patch levels 2 onwards. The
+reason these scripts are also included as a patch level rather than being in
+the program is so that EVERY single change to the database is contained in the
+scripts.
+
+=head1 SEE ALSO
+
+pgpatcher
+
+=head1 AUTHOR
+
+Written by Andrew Chilton <andychilton@gmail.com> (http://www.chilts.org/).
+
+=head1 REPORTING BUGS
+
+Head over to <http://code.google.com/p/pgpatcher/issues/list> and input what
+you expected to happen, what actually happened and any supplementary data you
+have, like patch scripts.
+
+=head1 COPYRIGHT
+
+Copyright 2006 Andrew Chilton (http://www.chilts.org/)
+
+This program is free software; you can redistribute it and/or modify it under
+the same terms as Perl itself.
+
+See http://www.perl.com/language/misc/Artistic.html
+
+=cut

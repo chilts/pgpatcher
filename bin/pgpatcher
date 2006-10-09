@@ -1,0 +1,447 @@
+#!/usr/bin/perl
+## -------------------------------------------------------------------*-perl-*-
+#
+# Copyright (c) 2005 Martyn Smith <martyn.smith@gmail.com>
+#  - original version
+#
+# Copyright (c) 2005-2006 Andrew Chilton <andychilton@gmail.com>
+#  - re-factor, generalisation and maintenance
+#
+# This code is hereby licensed for public consumption under either the
+# GNU GPL v2 or greater, or Larry Wall's Artistic license - your choice.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+#
+## ----------------------------------------------------------------------------
+
+use strict;
+use warnings;
+
+use IO::File;
+use Data::Dumper;
+use DBI;
+use Getopt::Mixed "nextOption";
+use Config::IniFiles;
+
+## ----------------------------------------------------------------------------
+# globals
+
+my @in_opts = qw( dbname=s   d>dbname
+                  host=s     h>host
+                  port=i     p>port
+                  username=s U>username
+                  script=s   s>script
+                  name=s     n>name
+                  level=i    l>level
+                  verbose    v>verbose
+                  help
+                  version );
+
+my $DEBUG = 0;
+
+## ----------------------------------------------------------------------------
+
+MAIN: {
+    # get the command line options
+    my $opts = { script => 'patch', name => 'Patch Level' };
+    Getopt::Mixed::init( @in_opts );
+    while (my ($option, $value, $pretty) = nextOption()) {
+        $opts->{$option} = $value;
+    }
+    Getopt::Mixed::cleanup();
+    foreach ( qw(verbose help version) ) {
+        $opts->{$_} = 1 if exists $opts->{$_};
+    }
+    dmp('opts', $opts);
+
+    # do the version and help
+    if ( exists $opts->{version} ) {
+        print "$0 v0.1\n";
+        exit 0;
+    }
+
+    if ( exists $opts->{help} ) {
+        usage();
+        exit 0;
+    }
+
+    set_verbose( $opts->{verbose} );
+
+    # check we have a database name
+    unless ( exists $opts->{dbname} ) {
+        Getopt::Mixed::abortMsg("specify the database name");
+        exit 0;
+    }
+
+    # connect to the database
+    my $connect = "dbi:Pg:dbname=$opts->{dbname}";
+    $connect .= ";host=$opts->{host}" if defined $opts->{host};
+    $connect .= ";port=$opts->{port}" if defined $opts->{port};
+
+    my $dbh = DBI->connect( $connect,
+                            $opts->{username},
+                            $opts->{password},
+                            { RaiseError => 1,
+                              PrintError => 0,
+                              AutoCommit => 1 } )
+        or die "Couldn't connect: " . $DBI::errstr;
+
+    # get the current patch level of the database
+    my $level = get_current_patch_level($dbh, $opts->{name});
+
+    line('=');
+    msg_level($level);
+
+    unless ( defined $opts->{level} ) {
+        line('=');
+        exit 0;
+    }
+
+    # find all the patch files
+    my $patches = find_patch_filenames($opts->{script});
+
+    verbose("Will patch from patch level '$level' to '$opts->{level}'\n");
+    if ( $level == $opts->{level} ) {
+        msg("INFO: No patching required, database already at same patch level\n");
+        msg_level($level);
+        line('=');
+        exit 0;
+    }
+
+    # see if we have all the patches necessary
+    my @required_patches = get_patch_list($level, $opts->{level}, $patches);
+    unless ( @required_patches ) {
+        print STDERR "ERROR: Not all patch files are available\n";
+        msg_level($level);
+        line('=');
+        exit 2;
+    }
+
+    foreach my $patch ( @required_patches ) {
+        line('-');
+        verbose("Applying patch '$patch->{script}' to level $patch->{to}");
+        apply_patch($opts, $patch->{script}, $dbh, $opts->{name}, $patch->{to});
+    }
+    line('-');
+
+    $level = get_current_patch_level($dbh, $opts->{name});
+    msg_level($level);
+    line('=');
+}
+
+## ----------------------------------------------------------------------------
+# subs
+
+sub get_patch_list {
+    my ($from, $to, $patches) = @_;
+    my @patchlist;
+
+    my $step = ($from < $to) ? 1 : -1;
+
+    until ( $from == $to ) {
+        if ( exists $patches->{$from}{$from+$step} ) {
+            push @patchlist, {
+                script => $patches->{$from}{$from+$step},
+                to => $from+$step,
+            };
+            verbose("Todo patch list: $patches->{$from}{$from+$step}");
+        } else {
+            # not all patches are available
+            return ();
+        }
+        $from += $step;
+    }
+    return @patchlist;
+}
+
+sub get_current_patch_level {
+    my ($dbh, $name) = @_;
+
+    my $table_info = $dbh->selectrow_hashref("SELECT * FROM pg_tables WHERE tablename = 'property'");
+
+    # if this table doesn't exist, then we must be at patch level 0
+    return 0 unless ref $table_info eq 'HASH' and scalar %$table_info;
+
+    my $db_patch_level = $dbh->prepare("
+        SELECT
+            value
+        FROM
+            property
+        WHERE
+            key = ?
+    ") or die("Can't prepare : " . $dbh->errstr());
+
+    $db_patch_level->execute( $name )
+        or die("Can't execute : " . $db_patch_level->errstr());
+
+    my ($level) = $db_patch_level->fetchrow_array();
+    return $level;
+}
+
+sub find_patch_filenames {
+    my ($script) = @_;
+    my $patches = {};
+
+    verbose("Patches...");
+    foreach ( sort <${script}*.sql> ) {
+        my ($from, $to) = $_ =~ m{ ^ ${script} _ (\d+) _ (\d+) \. sql $ }xms;
+        if ( defined $from and defined $to ) {
+            verbose(" - found  '$_'");
+            $patches->{$from}{$to} = $_;
+        } else {
+            verbose(" - ignore '$_'");
+        }
+    }
+
+    return $patches;
+}
+
+sub apply_patch {
+    my ($opts, $script, $dbh, $name, $final_patch_level) = @_;
+    my @cmdline;
+
+    msg("Applying '$script'...\n\n");
+
+    push @cmdline, 'psql';
+    push @cmdline, '-d', $opts->{dbname} if $opts->{dbname};
+    push @cmdline, '-h', $opts->{host} if $opts->{host};
+    push @cmdline, '-p', $opts->{port} if $opts->{port};
+    push @cmdline, '-U', $opts->{username} if $opts->{username};
+    push @cmdline, '-f', $script;
+
+    # open the patch
+    my @patch;
+    my $fh = IO::File->new($script, 'r');
+    @patch = $fh->getlines();
+    $fh->close();
+
+    my $pid = open(PSQL, "| @cmdline") or die "Couldn't fork: $!\n";
+    print PSQL @patch, "\n";
+    close(PSQL) or die "Couldn't close: $!\n";
+
+    my $new_level = get_current_patch_level($dbh, $name);
+    if ( $new_level == $final_patch_level ) {
+        msg("\nPatch to PATCH LEVEL '$final_patch_level' successful\n");
+    } else {
+        die "Patch '$script' didn't update db patch level to '$final_patch_level' (now at '$new_level')\n";
+    }
+}
+
+sub usage {
+    print <<"END_USAGE";
+Usage: $0 -d DBNAME [OPTIONS]...
+
+Options:
+  -d, --dbname DBNAME      database name to patch
+  -h, --host HOSTNAME      database server host or socket directory
+  -p, --port PORT          database server port number
+  -U, --username USERNAME  connect as specified database user
+  -s, --script SCRIPTNAME  basename of patch scripts to use (default: "patch")
+  -n, --name PATCHNAME     the patch name to use (default: 'Patch Level')
+  -l, --level PATCHLEVEL   version to take database to
+  -v, --verbose            prints more information
+      --help               prints help then quits
+      --version            prints version information then quits
+
+Report bugs at <http://code.google.com/p/pgpatcher/issues/list>.
+END_USAGE
+}
+
+{
+    my ($VERBOSE);
+    sub set_verbose { $VERBOSE = $_[0]; };
+    sub verbose { print $_[0], "\n" if $VERBOSE; }
+}
+
+sub msg_level {
+    my ($level) = @_;
+    msg("\n   Current DB PATCH LEVEL = '" . ($level || '[unknown]') . "'\n\n");
+}
+
+sub line {
+    msg($_[0] x 79, "\n");
+}
+
+sub msg {
+    print @_;
+}
+
+sub debug {
+    print @_ if $DEBUG;
+}
+
+sub dmp {
+    my ($text, $var) = @_;
+    print Data::Dumper->Dump([$var], [$text]) if $DEBUG;
+}
+
+## ----------------------------------------------------------------------------
+=pod
+
+=head1 NAME
+
+pgpatcher - a tool to help patch a PostgreSQL database
+
+=head1 SYNOPSIS
+
+B<pgpatcher> [OPTION]...
+
+=head1 EXAMPLES
+
+    # report patch level of the database
+    pgpatcher dbname -U username
+
+    # patch to level 3, don't require a username
+    pgpatcher dbname -l 3
+
+    # patch back to level 2
+    pgpatcher dbname -U username -l 2
+
+    # patch to level 4 using dbupdates as the patch script prefix
+    pgpatcher dbname -U username -s dbupdates -l 4
+
+    # patch to level 4, using port 5432
+    pgpatcher dbname -U username -p 5432 -l 4
+
+    # patch 'MyBlog' to level 4, using port 5432
+    pgpatcher dbname -U username -p 5432 -n MyBlog -l 4
+
+=head1 DESCRIPTION
+
+Patching a database is annoying and painful. Well, until you get into the
+routine of doing it and you're using PostgreSQL. Then it's a little easier. But
+why not let something else do the logic behind it, while you get on write the
+actual script.
+
+Let this script do the logic for you. It even provides a way to keep track of
+the patch level inside the database.
+
+=head1 OPTIONS
+
+=over 4
+
+=item -h, --host HOSTNAME
+
+The host where the database lives. Else, will use the default postgres host.
+
+=item -p, --port PORT
+
+The port the postgres server is listening on. Else will use the default
+postgres port.  The file to save to. If not given, uses STDOUT.
+
+=item -U, --username USER
+
+The username to connect to the database as. Else will use the default postgres
+user (usually your login).
+
+=item -s, --script SCRIPTNAME
+
+The patch script prefix to find the patch scripts (default: 'patch'). Patch
+scripts are of the form:
+
+    patch_<fromlevel>_<tolevel>.sql
+
+which works both ways. Eg. to patch from level 0 to 2, you require:
+
+    patch_0_1.sql
+    patch_1_2.sql
+
+You probably also want:
+
+    patch_2_1.sql
+    patch_1_0.sql
+
+An example of using a different name could be C<-s script> for which you'd
+required the following files for patch level 1:
+
+    script_0_1.sql
+    script_1_0.sql
+
+Also, see below for a standard patch_0_1.sql and patch_1_0.sql.
+
+=item -n, --name PATCHNAME
+
+Allows patching using different names. For example, if you have some blog
+tables and some news tables which are not really related and are being patched
+separately, you may want to choose a different patch name for each of them, say
+'BlogPatchLevel' and 'NewsPatchLevel'.
+
+Generally you won't need this, but it might help for more advanced uses. As
+another example, you have patches to update the tables you created but you also
+have some tables you created for a plugin piece of software you're using. If
+that is upgrade separately, you could patch that independently of your own
+tables. It's kinda hard to describe, but you can probably see the use for it,
+so it is provided.
+
+=item -l, --level PATCHLEVEL
+
+The number to patch to. These must be non-negative integers. Each script which
+changes the database (and hence has a patch leve), must make sure to update the
+actual patch level in the database to be the one it says it will patch to
+(ie. the patch includes both the patch and the update of the patch level, all
+in the same transaction).
+
+=item -h, --help
+
+Outputs help information and exits.
+
+=item -V, --version
+
+Outputs version information and exits.
+
+=back
+
+=head2 Example Patch Scripts
+
+An example patch_0_1.sql:
+
+    BEGIN;
+    CREATE TABLE property (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    );
+    INSERT INTO property(key, value) VALUES('PATCH_LEVEL', 1);
+    COMMIT;
+
+An example patch_1_0.sql:
+
+    BEGIN;
+    DROP TABLE property;
+    COMMIT;
+
+To make it easy, you could leave both of these patch scripts as they are and
+only start doing your own database definition in patch levels 2 onwards. The
+reason these scripts are also included as a patch level rather than being in
+the program is so that EVERY single change to the database is contained in the
+scripts.
+
+=head1 SEE ALSO
+
+pgcreatepatch
+
+=head1 AUTHOR
+
+Based on an original script by Martyn Smith <martyn.smith@gmail.com>
+
+Written by Andrew Chilton <andychilton@gmail.com> (http://www.chilts.org/).
+
+=head1 REPORTING BUGS
+
+Head over to <http://code.google.com/p/pgpatcher/issues/list> and input what
+you expected to happen, what actually happened and any supplementary data you
+have, like patch scripts.
+
+=head1 COPYRIGHT
+
+Copyright 2005 Martyn Smith.
+
+Copyright 2005-2006 Andrew Chilton (http://www.chilts.org/)
+
+This program is free software; you can redistribute it and/or modify it under
+the same terms as Perl itself.
+
+See http://www.perl.com/language/misc/Artistic.html
+
+=cut
