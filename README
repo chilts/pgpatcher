@@ -1,0 +1,18 @@
+-------------------------------------------------------------------------------
+
+Debian Packaging
+
+To create a Debian package, run the following commands from the top level
+directory (ie. the one with the following files/dirs):
+
+ $ cd /path/to/pgpatcher
+ $ ls -F
+ bin/  db/  debian/  Makefile  README
+ $ fakeroot dpkg-buildpackage
+ ...etc...
+ $ ls ../*.deb
+ ../pgpatcher_0.1.0_all.deb
+ $ lintian ../*.deb
+ $
+
+-------------------------------------------------------------------------------

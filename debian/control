@@ -1,0 +1,18 @@
+Source: pgpatcher
+Section: perl
+Priority: optional
+Maintainer: Andrew Chilton <andychilton@gmail.com>
+Uploaders: Andrew Chilton <andychilton@gmail.com>
+Standards-Version: 3.6.1
+Build-Depends-Indep: debhelper (>= 4.1), perl
+
+Package: pgpatcher
+Section: perl
+Priority: optional
+Architecture: all
+Depends: ${perl:Depends}, libdata-dumper-perl, libdbi-perl, libdbd-pg-perl, libgetopt-mixed-perl
+Description: tool to help with patching a PostgreSQL database
+ Using the pgcreatepatch tool to create skeleton patches and the pgpatcher tool
+ to apply them to a PostgreSQL database enables easier re-creation and provides
+ historic information It also gives you more control over applying DDL changes
+ to your database schema.
