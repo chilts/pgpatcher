@@ -23,7 +23,6 @@ use IO::File;
 use Data::Dumper;
 use DBI;
 use Getopt::Mixed "nextOption";
-use Config::IniFiles;
 
 ## ----------------------------------------------------------------------------
 # globals
