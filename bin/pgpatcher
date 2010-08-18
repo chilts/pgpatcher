@@ -245,7 +245,7 @@ Options:
       --help               prints help then quits
       --version            prints version information then quits
 
-Report bugs to <andychilton@gmail.com>.
+Report bugs to <andychilton\@gmail.com>.
 END_USAGE
 }
 
