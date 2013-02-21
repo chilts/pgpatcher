@@ -82,7 +82,7 @@ MAIN: {
 
     my $dbh = DBI->connect( $connect,
                             $opts->{username},
-                            $opts->{password},
+                            undef,
                             { RaiseError => 1,
                               PrintError => 0,
                               AutoCommit => 1 } )
@@ -244,6 +244,8 @@ Options:
   -v, --verbose            prints more information
       --help               prints help then quits
       --version            prints version information then quits
+
+Note: if your DB requires a password, set the PGPASSWORD environment variable.
 
 Report bugs to <andychilton\@gmail.com>.
 END_USAGE
